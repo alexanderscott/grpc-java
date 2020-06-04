@@ -16,6 +16,10 @@
 
 package io.grpc.examples.retrying;
 
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.MoreExecutors;
 import com.google.gson.Gson;
 import com.google.gson.stream.JsonReader;
 import io.grpc.ManagedChannel;
@@ -27,9 +31,8 @@ import io.grpc.examples.helloworld.HelloRequest;
 
 import java.io.InputStreamReader;
 import java.util.Map;
-import java.util.concurrent.ForkJoinPool;
-import java.util.concurrent.PriorityBlockingQueue;
-import java.util.concurrent.TimeUnit;
+import java.util.Queue;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -40,45 +43,84 @@ import static java.nio.charset.StandardCharsets.UTF_8;
  * A client that requests a greeting from the {@link RetryingHelloWorldServer} with a retrying policy.
  */
 public class RetryingHelloWorldClient {
-  static final String ENV_DISABLE_RETRYING = "DISABLE_RETRYING_IN_RETRYING_EXAMPLE";
+  static final String ENV_ENABLE_RETRY_FUTURES = "ENV_ENABLE_RETRY_FUTURES_IN_EXAMPLE";
 
   private static final Logger logger = Logger.getLogger(RetryingHelloWorldClient.class.getName());
 
-  private final boolean retrying;
+  private final CountDownLatch countdownLatch;
+  private final boolean retryingFutures;
   private final ManagedChannel channel;
   private final GreeterGrpc.GreeterBlockingStub blockingStub;
+  private final GreeterGrpc.GreeterFutureStub futureStub;
   private final PriorityBlockingQueue<Long> latencies = new PriorityBlockingQueue<>();
   private final AtomicInteger failedRpcs = new AtomicInteger();
 
-  /** Construct client connecting to HelloWorld server at {@code host:port}. */
-  public RetryingHelloWorldClient(String host, int port, boolean retrying) {
+  /**
+   * Construct client connecting to HelloWorld server at {@code host:port}.
+   */
+  public RetryingHelloWorldClient(String host, int port, int callCount, boolean enableFutures) {
     Map<String, ?> retryingServiceConfig =
-      new Gson()
-          .fromJson(
-              new JsonReader(
-                  new InputStreamReader(
-                      RetryingHelloWorldClient.class.getResourceAsStream(
-                          "retrying_service_config.json"),
-                      UTF_8)),
-              Map.class);
+        new Gson()
+            .fromJson(
+                new JsonReader(
+                    new InputStreamReader(
+                        RetryingHelloWorldClient.class.getResourceAsStream(
+                            "retrying_service_config.json"),
+                        UTF_8)),
+                Map.class);
 
     ManagedChannelBuilder<?> channelBuilder = ManagedChannelBuilder.forAddress(host, port)
         // Channels are secure by default (via SSL/TLS). For the example we disable TLS to avoid
         // needing certificates.
         .usePlaintext();
-    if (retrying) {
-      channelBuilder.defaultServiceConfig(retryingServiceConfig).enableRetry();
-    }
+    channelBuilder.defaultServiceConfig(retryingServiceConfig).enableRetry();
     channel = channelBuilder.build();
     blockingStub = GreeterGrpc.newBlockingStub(channel);
-    this.retrying = retrying;
+    futureStub = GreeterGrpc.newFutureStub(channel);
+    this.retryingFutures = enableFutures;
+    this.countdownLatch = new CountDownLatch(callCount);
   }
 
   public void shutdown() throws InterruptedException {
-    channel.shutdown().awaitTermination(5, TimeUnit.SECONDS);
+    channel.shutdown().awaitTermination(30, TimeUnit.SECONDS);
   }
 
-  /** Say hello to server. */
+  public ListenableFuture<HelloReply> greetFuture(String name) {
+    HelloRequest request = HelloRequest.newBuilder().setName(name).build();
+    HelloReply response = null;
+    final long startTime = System.nanoTime();
+    final String currentName = name;
+    logger.log(Level.INFO, "Starting request for user {0}", new Object[]{name});
+    ListenableFuture<HelloReply> responseFuture = futureStub.sayHello(request);
+    Futures.addCallback(responseFuture, new FutureCallback<HelloReply>() {
+      @Override
+      public void onSuccess(HelloReply response) {
+        logger.log(Level.INFO, "Successful RPC response for user {0}: {1}", new Object[]{currentName, response.getMessage()});
+        long latencyMills = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
+        latencies.offer(latencyMills);
+        countdownLatch.countDown();
+      }
+
+      @Override
+      public void onFailure(Throwable throwable) {
+        if (throwable instanceof StatusRuntimeException) {
+          failedRpcs.incrementAndGet();
+          StatusRuntimeException e = (StatusRuntimeException) throwable;
+          logger.log(Level.INFO, "Failure RPC response for user {0}: {1}",
+              new Object[]{currentName, e});
+          long latencyMills = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
+          latencies.offer(latencyMills);
+          countdownLatch.countDown();
+        }
+      }
+    }, MoreExecutors.directExecutor());
+
+    return responseFuture;
+  }
+
+  /**
+   * Say hello to server.
+   */
   public void greet(String name) {
     HelloRequest request = HelloRequest.newBuilder().setName(name).build();
     HelloReply response = null;
@@ -97,16 +139,23 @@ public class RetryingHelloWorldClient {
       logger.log(
           Level.INFO,
           "Greeting: {0}. Latency: {1}ms",
-          new Object[] {response.getMessage(), latencyMills});
+          new Object[]{response.getMessage(), latencyMills});
     } else {
       logger.log(
           Level.INFO,
           "RPC failed: {0}. Latency: {1}ms",
-          new Object[] {statusRuntimeException.getStatus(), latencyMills});
+          new Object[]{statusRuntimeException.getStatus(), latencyMills});
     }
+    countdownLatch.countDown();
   }
 
   void printSummary() {
+    try {
+      countdownLatch.await();
+    } catch(InterruptedException e) {
+      logger.log(Level.INFO, "Countdown latch interrupted, exiting");
+      return;
+    }
     int rpcCount = latencies.size();
     long latency50 = 0L;
     long latency90 = 0L;
@@ -139,7 +188,7 @@ public class RetryingHelloWorldClient {
     logger.log(
         Level.INFO,
         "\n\nTotal RPCs sent: {0}. Total RPCs failed: {1}\n"
-            + (retrying ? "[Retrying enabled]\n" : "[Retrying disabled]\n")
+            + "[Retrying enabled]\n"
             + "========================\n"
             + "50% latency: {2}ms\n"
             + "90% latency: {3}ms\n"
@@ -152,36 +201,44 @@ public class RetryingHelloWorldClient {
             rpcCount, failedRpcs.get(),
             latency50, latency90, latency95, latency99, latency999, latencyMax});
 
-    if (retrying) {
+    if (retryingFutures) {
       logger.log(
           Level.INFO,
-          "To disable retrying, run the client with environment variable {0}=true.",
-          ENV_DISABLE_RETRYING);
+          "Testing with GRPC future stubs.  To test with blocking stubs, run the client with environment variable {0}=false.",
+          ENV_ENABLE_RETRY_FUTURES);
     } else {
       logger.log(
           Level.INFO,
-          "To enable retrying, unset environment variable {0} and then run the client.",
-          ENV_DISABLE_RETRYING);
+          "Testing with GRPC blocking stubs.  To test with future stubs, run the client with environment variable {0}=true.",
+          ENV_ENABLE_RETRY_FUTURES);
     }
   }
 
   public static void main(String[] args) throws Exception {
-    boolean retrying = !Boolean.parseBoolean(System.getenv(ENV_DISABLE_RETRYING));
-    final RetryingHelloWorldClient client = new RetryingHelloWorldClient("localhost", 50051, retrying);
-    ForkJoinPool executor = new ForkJoinPool();
+//    final boolean retryingFutures = Boolean.parseBoolean(System.getenv(ENV_ENABLE_RETRY_FUTURES));
+    final boolean retryingFutures = true;
+    final int callCount = 20;
 
-    for (int i = 0; i < 20; i++) {
+    final RetryingHelloWorldClient client = new RetryingHelloWorldClient("localhost", 50051, callCount, retryingFutures);
+    final ForkJoinPool executor = new ForkJoinPool();
+    final Queue<ListenableFuture<HelloReply>> greetFutures = new ConcurrentLinkedQueue<ListenableFuture<HelloReply>>();
+    for (int i = 0; i < callCount; i++) {
       final String userId = "user" + i;
       executor.execute(
           new Runnable() {
             @Override
             public void run() {
-              client.greet(userId);
+              if (retryingFutures) {
+                greetFutures.add(client.greetFuture(userId));
+              } else {
+                client.greet(userId);
+              }
             }
           });
     }
 
     executor.awaitQuiescence(100, TimeUnit.SECONDS);
+    logger.log(Level.INFO, "Completed all GRPC calls");
     executor.shutdown();
     client.printSummary();
     client.shutdown();

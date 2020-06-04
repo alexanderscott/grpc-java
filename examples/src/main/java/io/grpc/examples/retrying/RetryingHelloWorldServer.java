@@ -25,7 +25,6 @@ import io.grpc.examples.helloworld.HelloRequest;
 import io.grpc.stub.StreamObserver;
 
 import java.io.IOException;
-import java.util.Random;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
@@ -90,8 +89,8 @@ public class RetryingHelloWorldServer {
     @Override
     public void sayHello(HelloRequest request, StreamObserver<HelloReply> responseObserver) {
         int count = retryCounter.incrementAndGet();
-      if (count < 50) {
-        logger.info("Returning error, count: " + count);
+      if (count < 75) {
+        logger.info("Returning stubbed UNAVAILABLE error, count: " + count);
         responseObserver.onError(Status.UNAVAILABLE
                 .withDescription("Eggplant Xerxes Crybaby Overbite Narwhal").asRuntimeException());
       } else {
@@ -100,12 +99,5 @@ public class RetryingHelloWorldServer {
         responseObserver.onCompleted();
       }
     }
-
-//    @Override
-//    public void sayHello(HelloRequest req, StreamObserver<HelloReply> responseObserver) {
-//      HelloReply reply = HelloReply.newBuilder().setMessage("Hello " + req.getName()).build();
-//      responseObserver.onNext(reply);
-//      responseObserver.onCompleted();
-//    }
   }
 }
