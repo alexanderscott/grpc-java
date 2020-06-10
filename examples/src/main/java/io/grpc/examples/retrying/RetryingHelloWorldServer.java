@@ -17,8 +17,10 @@
 package io.grpc.examples.retrying;
 
 import io.grpc.*;
+
+import java.text.DecimalFormat;
+import java.util.Random;
 import java.util.concurrent.atomic.AtomicInteger;
-import io.grpc.ServerCall.Listener;
 import io.grpc.examples.helloworld.GreeterGrpc;
 import io.grpc.examples.helloworld.HelloReply;
 import io.grpc.examples.helloworld.HelloRequest;
@@ -29,10 +31,12 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 /**
- * A HelloWorld server that responds to requests with a long latency tail.
+ * A HelloWorld server that responds to requests with UNAVAILABLE with a given percentage.
  */
 public class RetryingHelloWorldServer {
   private static final Logger logger = Logger.getLogger(RetryingHelloWorldServer.class.getName());
+  private static final float unavailablePercentage = 0.5F;
+  private static Random random = new Random();
 
   private Server server;
 
@@ -44,6 +48,9 @@ public class RetryingHelloWorldServer {
         .build()
         .start();
     logger.info("Server started, listening on " + port);
+
+    DecimalFormat df = new DecimalFormat("#%");
+    logger.info("Responding as UNAVAILABLE to " + df.format(unavailablePercentage) + " requests");
     Runtime.getRuntime().addShutdownHook(new Thread() {
       @Override
       public void run() {
@@ -84,16 +91,17 @@ public class RetryingHelloWorldServer {
   }
 
   static class GreeterImpl extends GreeterGrpc.GreeterImplBase {
-    protected AtomicInteger retryCounter = new AtomicInteger(0);
+    AtomicInteger retryCounter = new AtomicInteger(0);
 
     @Override
     public void sayHello(HelloRequest request, StreamObserver<HelloReply> responseObserver) {
-        int count = retryCounter.incrementAndGet();
-      if (count < 75) {
-        logger.info("Returning stubbed UNAVAILABLE error, count: " + count);
+      int count = retryCounter.incrementAndGet();
+      if (random.nextFloat() < unavailablePercentage) {
+        logger.info("Returning stubbed UNAVAILABLE error. count: " + count);
         responseObserver.onError(Status.UNAVAILABLE
-                .withDescription("Eggplant Xerxes Crybaby Overbite Narwhal").asRuntimeException());
+            .withDescription("Greeter temporarily unavailable...").asRuntimeException());
       } else {
+        logger.info("Returning successful Hello response, count: " + count);
         HelloReply reply = HelloReply.newBuilder().setMessage("Hello " + request.getName()).build();
         responseObserver.onNext(reply);
         responseObserver.onCompleted();

@@ -9,7 +9,7 @@
       ],
 
       "retryPolicy": {
-        "maxAttempts": 10,
+        "maxAttempts": 5,
         "initialBackoff": "0.5s",
         "maxBackoff": "30s",
         "backoffMultiplier": 2,
